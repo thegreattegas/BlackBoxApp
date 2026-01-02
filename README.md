@@ -1,2 +1,2 @@
-# BlackBoxApp
+# BlackBoxApp (Flutter)
 BlackBox for FireAlarm
