@@ -1,1 +1,1413 @@
-import 'dart:async';import 'dart:convert';import 'package:flutter/material.dart';import 'package:flutter_blue_plus/flutter_blue_plus.dart';import 'package:permission_handler/permission_handler.dart';import 'package:shared_preferences/shared_preferences.dart';void main() {  runApp(const FireGuardianApp());}/// ==========================/// Enums: Language & Theme/// ==========================enum AppLang { en, zh }enum AppTheme { blue, orange, gray }class I18n {  static const _map = {    "app_title": {AppLang.en: "BlackBox", AppLang.zh: "BlackBox"},    "home": {AppLang.en: "Home", AppLang.zh: "首頁"},    "settings": {AppLang.en: "Settings", AppLang.zh: "設定"},    "scan_connect": {AppLang.en: "Scan & Connect", AppLang.zh: "掃描並連線"},    "connected": {AppLang.en: "Connected", AppLang.zh: "已連線"},    "not_connected": {AppLang.en: "Not connected", AppLang.zh: "未連線"},    "status_safe": {AppLang.en: "SAFE", AppLang.zh: "安全"},    "status_warning": {AppLang.en: "WARNING", AppLang.zh: "警告"},    "smoke": {AppLang.en: "Smoke", AppLang.zh: "煙霧"},    "fire": {AppLang.en: "Fire", AppLang.zh: "火焰"},    "smoke_limit": {AppLang.en: "Smoke Limit", AppLang.zh: "煙霧閾值"},    "flame_limit": {AppLang.en: "Flame Limit", AppLang.zh: "火焰閾值"},    "update_wifi": {AppLang.en: "Update WiFi Settings", AppLang.zh: "更新 WiFi 設定"},    "language": {AppLang.en: "Language", AppLang.zh: "語言"},    "theme": {AppLang.en: "Theme", AppLang.zh: "主題"},    "theme_blue": {AppLang.en: "Black Blue", AppLang.zh: "黑藍色"},    "theme_orange": {AppLang.en: "Black Orange", AppLang.zh: "黑橘色"},    "theme_gray": {AppLang.en: "Black Gray", AppLang.zh: "黑灰色"},  };  static String t(AppLang lang, String key) => _map[key]?[lang] ?? key;}/// ==========================/// Internet status/// ==========================enum NetStatus {  unknown, // waiting for WIFI_OK / WIFI_FAIL  online, // WIFI_OK  offlineNoInternet, // WIFI_FAIL  offlineNoWifiSaved, // no SSID saved locally}/// ===========================================================/// App State/// ===========================================================class AppState extends ChangeNotifier {  // ===== UUIDs =====  final String SERVICE_UUID = "4fafc201-1fb5-459e-8fcc-c5c9c331914b";  final String CHAR_SSID = "beb5483e-36e1-4688-b7f5-ea07361b26a8";  final String CHAR_PASS = "889e2486-2598-444f-954f-173627096756";  final String CHAR_TOKEN = "12345678-1234-1234-1234-1234567890ab";  final String CHAR_CHAT = "87654321-4321-4321-4321-ba0987654321";  final String CHAR_SAVE = "cafebabe-cafe-cafe-cafe-cafebabecafe";  final String SMOKE_CHAR = "cafebabe-cafe-cafe-cafe-cafebabecaf1";  final String FLAME_CHAR = "cafebabe-cafe-cafe-cafe-cafebabecaf2";  final String NOTIFY_CHAR = "cafebabe-cafe-cafe-cafe-cafebabecafd";  // ===== Notifiers =====  final ValueNotifier<AppLang> langVN = ValueNotifier(AppLang.en);  final ValueNotifier<AppTheme> themeVN = ValueNotifier(AppTheme.blue);  final ValueNotifier<int> liveTick = ValueNotifier(0);  final ValueNotifier<int> navVN = ValueNotifier(0);  // ===== Device / Live values =====  BluetoothDevice? device;  bool ready = false;  int smokeVal = 0;  int flameVal = 0;  double smokeLimit = 2000;  double flameLimit = 150;  BluetoothCharacteristic? _smokeChar;  BluetoothCharacteristic? _flameChar;  BluetoothCharacteristic? _notifyChar;  StreamSubscription<List<int>>? _notifySub;  NetStatus netStatus = NetStatus.unknown;  String wifiSsid = "";  String wifiIp = "";  DateTime _lastUi = DateTime.fromMillisecondsSinceEpoch(0);  Future<void> init() async {    final prefs = await SharedPreferences.getInstance();    final l = prefs.getString("lang") ?? "en";    langVN.value = (l == "zh") ? AppLang.zh : AppLang.en;    final t = prefs.getString("theme") ?? "blue";    if (t == "orange") themeVN.value = AppTheme.orange;    else if (t == "gray") themeVN.value = AppTheme.gray;    else themeVN.value = AppTheme.blue;  }  Future<void> setLang(AppLang l) async {    langVN.value = l;    final prefs = await SharedPreferences.getInstance();    await prefs.setString("lang", l == AppLang.zh ? "zh" : "en");  }  Future<void> setTheme(AppTheme t) async {    themeVN.value = t;    final prefs = await SharedPreferences.getInstance();    String val = "blue";    if (t == AppTheme.orange) val = "orange";    if (t == AppTheme.gray) val = "gray";    await prefs.setString("theme", val);  }  Color getThemeColor() {    switch (themeVN.value) {      case AppTheme.orange: return Colors.deepOrange;      case AppTheme.gray: return Colors.grey;      case AppTheme.blue:      default: return Colors.blue;    }  }  Future<void> _loadSavedWifiForDevice(String deviceId) async {    final prefs = await SharedPreferences.getInstance();    wifiSsid = prefs.getString('${deviceId}_ssid') ?? '';    wifiIp = "";    if (wifiSsid.trim().isEmpty) {      netStatus = NetStatus.offlineNoWifiSaved;    } else {      netStatus = NetStatus.unknown;    }  }  Future<void> connectAndStart(BluetoothDevice d) async {    device = d;    ready = false;    navVN.value = 0;    await _loadSavedWifiForDevice(d.remoteId.toString());    liveTick.value++;    notifyListeners();    try {      await _discoverServicesAndListen().timeout(          const Duration(seconds: 6),          onTimeout: () {            print("Discovery timed out, forcing ready.");            return;          }      );    } catch (e) {      print("Error during connection: $e");    } finally {      ready = true;      liveTick.value++;      notifyListeners();    }  }  void _handleNotifyMessage(String msg) {    bool urgentUpdate = false;    if (msg == "WIFI_OK") {      netStatus = NetStatus.online;      urgentUpdate = true;    } else if (msg == "WIFI_FAIL") {      if (wifiSsid.trim().isEmpty) {        netStatus = NetStatus.offlineNoWifiSaved;      } else {        netStatus = NetStatus.offlineNoInternet;      }      urgentUpdate = true;    } else if (msg.startsWith("SSID:")) {      wifiSsid = msg.substring(5).trim();      if (wifiSsid == "<none>") wifiSsid = "";      urgentUpdate = true;    } else if (msg.startsWith("IP:")) {      wifiIp = msg.substring(3).trim();      urgentUpdate = true;    } else if (msg.startsWith("LIVE:")) {      final parts = msg.split(":");      if (parts.length >= 3) {        smokeVal = int.tryParse(parts[1]) ?? 0;        flameVal = int.tryParse(parts[2]) ?? 0;        final now = DateTime.now();        if (now.difference(_lastUi).inMilliseconds >= 200) {          _lastUi = now;          liveTick.value++;        }      }      return;    }    if (urgentUpdate) {      liveTick.value++;      notifyListeners();    }  }  Future<void> _discoverServicesAndListen() async {    if (device == null) return;    List<BluetoothService> services = [];    try {      services = await device!.discoverServices();    } catch (e) {      return;    }    _smokeChar = null;    _flameChar = null;    _notifyChar = null;    for (final s in services) {      for (final c in s.characteristics) {        final uuid = c.uuid.toString().toLowerCase();        if (uuid == SMOKE_CHAR) _smokeChar = c;        if (uuid == FLAME_CHAR) _flameChar = c;        if (uuid == NOTIFY_CHAR) _notifyChar = c;      }    }    // LOAD SAVED LIMITS    final prefs = await SharedPreferences.getInstance();    final id = device!.remoteId.toString();    smokeLimit = prefs.getDouble('${id}_smoke_limit') ?? 2000.0;    flameLimit = prefs.getDouble('${id}_flame_limit') ?? 150.0;    if (_notifyChar != null) {      await _notifyChar!.setNotifyValue(true);      await _notifySub?.cancel();      _notifySub = _notifyChar!.onValueReceived.listen((value) {        final msg = utf8.decode(value);        _handleNotifyMessage(msg);      });    }    // WRITE SAVED LIMITS TO DEVICE    try {      await writeLimits(smokeLimit, flameLimit);    } catch (_) {}    notifyListeners();  }  Future<void> writeLimits(double smoke, double flame) async {    smokeLimit = smoke;    flameLimit = flame;    if (_smokeChar != null) {      await _smokeChar!.write(utf8.encode(smoke.toInt().toString()));    }    if (_flameChar != null) {      await _flameChar!.write(utf8.encode(flame.toInt().toString()));    }    if (device != null) {      final prefs = await SharedPreferences.getInstance();      final id = device!.remoteId.toString();      await prefs.setDouble('${id}_smoke_limit', smokeLimit);      await prefs.setDouble('${id}_flame_limit', flameLimit);    }    liveTick.value++;  }  Future<void> disconnect() async {    try {      await _notifySub?.cancel();      _notifySub = null;      await device?.disconnect();    } catch (_) {}    device = null;    ready = false;    netStatus = NetStatus.unknown;    wifiSsid = "";    wifiIp = "";    liveTick.value++;    notifyListeners();  }}final AppState app = AppState();/// ===========================================================/// App/// ===========================================================class FireGuardianApp extends StatefulWidget {  const FireGuardianApp({super.key});  @override  State<FireGuardianApp> createState() => _FireGuardianAppState();}class _FireGuardianAppState extends State<FireGuardianApp> {  @override  void initState() {    super.initState();    _init();  }  Future<void> _init() async {    await [      Permission.location,      Permission.bluetoothScan,      Permission.bluetoothConnect,      Permission.bluetoothAdvertise,    ].request();    await app.init();    if (mounted) setState(() {});  }  @override  Widget build(BuildContext context) {    return ValueListenableBuilder<AppLang>(      valueListenable: app.langVN,      builder: (_, lang, __) {        return ValueListenableBuilder<AppTheme>(          valueListenable: app.themeVN,          builder: (_, theme, ___) {            Color primaryColor = Colors.blue;            if (theme == AppTheme.orange) primaryColor = Colors.deepOrange;            if (theme == AppTheme.gray) primaryColor = Colors.grey;            return MaterialApp(              title: I18n.t(lang, "app_title"),              debugShowCheckedModeBanner: false,              theme: ThemeData(                  brightness: Brightness.dark,                  primaryColor: primaryColor,                  scaffoldBackgroundColor: const Color(0xFF121212),                  useMaterial3: true,                  colorScheme: ColorScheme.dark(                    primary: primaryColor,                    secondary: primaryColor,                  ),                  elevatedButtonTheme: ElevatedButtonThemeData(                      style: ElevatedButton.styleFrom(                        backgroundColor: primaryColor,                        foregroundColor: Colors.white,                      )),                  sliderTheme: SliderThemeData(                    activeTrackColor: primaryColor,                    thumbColor: primaryColor,                  )),              home: const DrawerShell(),            );          },        );      },    );  }}/// ===========================================================/// Drawer Shell/// ===========================================================class DrawerShell extends StatefulWidget {  const DrawerShell({super.key});  @override  State<DrawerShell> createState() => _DrawerShellState();}class _DrawerShellState extends State<DrawerShell> {  int idx = 0;  late VoidCallback _navListener;  @override  void initState() {    super.initState();    _navListener = () {      if (!mounted) return;      setState(() => idx = app.navVN.value);    };    app.navVN.addListener(_navListener);  }  @override  void dispose() {    app.navVN.removeListener(_navListener);    super.dispose();  }  @override  Widget build(BuildContext context) {    return ValueListenableBuilder<AppLang>(      valueListenable: app.langVN,      builder: (_, lang, __) {        final themeColor = app.getThemeColor();        final pages = const [          HomePage(),          SettingsPage(),        ];        final titles = [          I18n.t(lang, "home"),          I18n.t(lang, "settings"),        ];        if (idx >= pages.length) idx = 0;        return Scaffold(          appBar: AppBar(            title: Text("🔥 ${titles[idx]}"),            centerTitle: true,            backgroundColor: Colors.transparent,          ),          drawer: Drawer(            backgroundColor: const Color(0xFF1E1E2C),            child: ValueListenableBuilder<int>(              valueListenable: app.liveTick,              builder: (_, __, ___) {                final connected = app.device != null;                final ssid =                app.wifiSsid.trim().isEmpty ? "<none>" : app.wifiSsid.trim();                final online = app.netStatus == NetStatus.online;                String sub = connected                    ? "${I18n.t(lang, "connected")}: ${app.device!.remoteId}"                    : I18n.t(lang, "not_connected");                if (connected) {                  sub += "\nWiFi: $ssid • ${online ? "ONLINE" : "OFFLINE"}";                  if (online && app.wifiIp.trim().isNotEmpty) {                    sub += "\nIP: ${app.wifiIp}";                  }                }                return Column(                  children: [                    const SizedBox(height: 40),                    ListTile(                      leading: Icon(Icons.local_fire_department, color: themeColor),                      title: Text(                        I18n.t(lang, "app_title"),                        style: const TextStyle(                            fontWeight: FontWeight.bold, fontSize: 18),                      ),                      subtitle: Text(                        sub,                        style: const TextStyle(color: Colors.grey),                      ),                    ),                    const Divider(color: Colors.grey),                    _drawerItem(Icons.home_rounded, I18n.t(lang, "home"), 0,                        themeColor),                    _drawerItem(Icons.settings_rounded, I18n.t(lang, "settings"),                        1, themeColor),                    const Spacer(),                    Padding(                      padding: const EdgeInsets.all(14),                      child: ElevatedButton.icon(                        style: ElevatedButton.styleFrom(                          minimumSize: const Size(double.infinity, 52),                          shape: RoundedRectangleBorder(                              borderRadius: BorderRadius.circular(14)),                        ),                        onPressed: () => _openSetupModal(context),                        icon: const Icon(Icons.bluetooth_searching),                        label: Text(I18n.t(lang, "scan_connect")),                      ),                    ),                    const SizedBox(height: 10),                  ],                );              },            ),          ),          body: pages[idx],        );      },    );  }  Widget _drawerItem(IconData icon, String title, int targetIdx, Color color) {    final selected = idx == targetIdx;    return ListTile(      leading: Icon(icon, color: selected ? color : Colors.grey),      title:      Text(title, style: TextStyle(color: selected ? color : Colors.white)),      selected: selected,      onTap: () {        app.navVN.value = targetIdx;        Navigator.pop(context);      },    );  }  void _openSetupModal(BuildContext context) {    Navigator.pop(context);    showModalBottomSheet(      context: context,      isScrollControlled: true,      isDismissible: false,      backgroundColor: Colors.transparent,      builder: (_) => const SetupModal(),    );  }}/// ===========================================================/// Page 1: Home/// ===========================================================class HomePage extends StatefulWidget {  const HomePage({super.key});  @override  State<HomePage> createState() => _HomePageState();}class _HomePageState extends State<HomePage> {  double _smokeTmp = app.smokeLimit;  double _flameTmp = app.flameLimit;  String? _lastDeviceId;  bool _valuesSynced = false;  void _syncTmpIfDeviceChanged() {    final id = app.device?.remoteId.toString();    // If device ID changed, reset our sync flag    if (id != _lastDeviceId) {      _lastDeviceId = id;      _valuesSynced = false;    }    // If we are connected & ready, but haven't synced saved values yet, do it now.    if (app.ready && !_valuesSynced) {      _smokeTmp = app.smokeLimit;      _flameTmp = app.flameLimit;      _valuesSynced = true;    }  }  @override  Widget build(BuildContext context) {    _syncTmpIfDeviceChanged();    final lang = app.langVN.value;    final themeColor = app.getThemeColor();    // FIXED: Added SingleChildScrollView to allow scrolling in landscape/small screens    return SingleChildScrollView(      child: Padding(        padding: const EdgeInsets.all(16),        child: ValueListenableBuilder<int>(            valueListenable: app.liveTick,            builder: (_, __, ___) {              _syncTmpIfDeviceChanged();              final connected = app.device != null;              final ready = app.ready;              final baseStatus = (!connected)                  ? I18n.t(lang, "not_connected")                  : (app.smokeVal > app.smokeLimit                  ? I18n.t(lang, "status_warning")                  : I18n.t(lang, "status_safe"));              final online = (app.netStatus == NetStatus.online);              final statusColor = (!connected)                  ? Colors.grey                  : (baseStatus == I18n.t(lang, "status_safe")                  ? Colors.green                  : Colors.orange);              return Column(                children: [                  Container(                    width: double.infinity,                    padding: const EdgeInsets.all(16),                    decoration: BoxDecoration(                      color: const Color(0xFF1E1E2C),                      borderRadius: BorderRadius.circular(20),                      border: Border.all(color: statusColor.withOpacity(0.35)),                    ),                    child: Row(                      children: [                        CircleAvatar(                          backgroundColor: statusColor.withOpacity(0.18),                          child: Icon(                            connected                                ? Icons.verified_rounded                                : Icons.bluetooth_disabled_rounded,                            color: statusColor,                          ),                        ),                        const SizedBox(width: 12),                        Expanded(                          child: Text(                            baseStatus,                            style: TextStyle(                                fontSize: 18,                                fontWeight: FontWeight.bold,                                color: statusColor),                          ),                        ),                        Text(                          connected ? (online ? "ONLINE" : "OFFLINE") : "OFFLINE",                          style: TextStyle(                            color: connected                                ? (online ? Colors.green : Colors.orange)                                : Colors.grey,                            fontWeight: FontWeight.bold,                          ),                        ),                      ],                    ),                  ),                  const SizedBox(height: 14),                  // REMOVED Expanded to allow scrolling. Card will take natural height.                  Card(                    color: const Color(0xFF1E1E2C),                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),                    child: Padding(                      padding: const EdgeInsets.all(16),                      child: (!connected)                          ? Center(                        child: Padding(                          padding: const EdgeInsets.symmetric(vertical: 40),                          child: Text(                            "Open sidebar → ${I18n.t(lang, "scan_connect")}",                            style: const TextStyle(color: Colors.grey),                            textAlign: TextAlign.center,                          ),                        ),                      )                          : (!ready)                          ? Center(                        child: Padding(                          padding: const EdgeInsets.symmetric(vertical: 40),                          child: Column(                            mainAxisAlignment: MainAxisAlignment.center,                            children: [                              CircularProgressIndicator(color: themeColor),                              const SizedBox(height: 16),                              const Text("Syncing...", style: TextStyle(color: Colors.grey)),                            ],                          ),                        ),                      )                          : Column(                        children: [                          Row(                            children: [                              Expanded(                                child: _gauge(                                  title: I18n.t(lang, "smoke"),                                  value: app.smokeVal,                                  icon: Icons.cloud_rounded,                                  danger: app.smokeVal > app.smokeLimit,                                ),                              ),                              const SizedBox(width: 12),                              Expanded(                                child: _gauge(                                  title: I18n.t(lang, "fire"),                                  value: app.flameVal,                                  icon: Icons.local_fire_department_rounded,                                  danger: app.flameVal < app.flameLimit,                                ),                              ),                            ],                          ),                          const SizedBox(height: 18),                          _slider(                            label: I18n.t(lang, "smoke_limit"),                            value: _smokeTmp,                            onChanged: (v) => setState(() => _smokeTmp = v),                            onChangeEnd: (v) => app.writeLimits(v, _flameTmp),                          ),                          const SizedBox(height: 10),                          _slider(                            label: I18n.t(lang, "flame_limit"),                            value: _flameTmp,                            onChanged: (v) => setState(() => _flameTmp = v),                            onChangeEnd: (v) => app.writeLimits(_smokeTmp, v),                          ),                          const SizedBox(height: 20), // Replaced Spacer with fixed height                          ElevatedButton.icon(                            style: ElevatedButton.styleFrom(                              backgroundColor: themeColor,                              minimumSize: const Size(double.infinity, 52),                              shape: RoundedRectangleBorder(                                  borderRadius: BorderRadius.circular(14)),                            ),                            onPressed: () => showModalBottomSheet(                              context: context,                              isScrollControlled: true,                              backgroundColor: Colors.transparent,                              builder: (_) =>                                  UpdateWifiModal(device: app.device!),                            ),                            icon: const Icon(Icons.wifi),                            label: Text(I18n.t(lang, "update_wifi")),                          ),                        ],                      ),                    ),                  ),                ],              );            }        ),      ),    );  }  Widget _gauge({    required String title,    required int value,    required IconData icon,    required bool danger,  }) {    return Container(      padding: const EdgeInsets.all(14),      decoration: BoxDecoration(        color: const Color(0xFF2A2A3C),        borderRadius: BorderRadius.circular(18),        border: danger ? Border.all(color: Colors.red, width: 2) : null,      ),      child: Column(        children: [          Icon(icon, color: danger ? Colors.red : Colors.grey, size: 28),          const SizedBox(height: 8),          Text(title, style: const TextStyle(color: Colors.grey)),          const SizedBox(height: 4),          Text("$value",              style: const TextStyle(fontSize: 26, fontWeight: FontWeight.bold)),        ],      ),    );  }  Widget _slider({    required String label,    required double value,    required ValueChanged<double> onChanged,    required ValueChanged<double> onChangeEnd,  }) {    return Column(      crossAxisAlignment: CrossAxisAlignment.start,      children: [        Row(children: [          Text(label),          const Spacer(),          Text(value.toInt().toString(),              style: const TextStyle(color: Colors.grey)),        ]),        Slider(          value: value.clamp(0, 4095),          min: 0,          max: 4095,          onChanged: onChanged,          onChangeEnd: onChangeEnd,        ),      ],    );  }}/// ===========================================================/// Page 2: Settings (Theme & Language)/// ===========================================================class SettingsPage extends StatelessWidget {  const SettingsPage({super.key});  @override  Widget build(BuildContext context) {    return ValueListenableBuilder<AppLang>(      valueListenable: app.langVN,      builder: (_, lang, __) {        return ValueListenableBuilder<AppTheme>(          valueListenable: app.themeVN,          builder: (_, theme, ___) {            final themeColor = app.getThemeColor();            // FIXED: Added SingleChildScrollView to allow scrolling in landscape/small screens            return SingleChildScrollView(              child: Padding(                padding: const EdgeInsets.all(16),                child: Column(                  children: [                    Card(                      color: const Color(0xFF1E1E2C),                      shape: RoundedRectangleBorder(                          borderRadius: BorderRadius.circular(18)),                      child: Padding(                        padding: const EdgeInsets.all(16),                        child: Column(                          crossAxisAlignment: CrossAxisAlignment.start,                          children: [                            Row(children: [                              Icon(Icons.language, color: themeColor),                              const SizedBox(width: 10),                              Text(I18n.t(lang, "language"),                                  style: const TextStyle(                                      fontWeight: FontWeight.bold, fontSize: 16)),                            ]),                            const SizedBox(height: 16),                            Row(                              children: [                                Expanded(                                  child: _selBtn("English", lang == AppLang.en,                                      themeColor, () => app.setLang(AppLang.en)),                                ),                                const SizedBox(width: 10),                                Expanded(                                  child: _selBtn("中文", lang == AppLang.zh,                                      themeColor, () => app.setLang(AppLang.zh)),                                ),                              ],                            )                          ],                        ),                      ),                    ),                    const SizedBox(height: 16),                    Card(                      color: const Color(0xFF1E1E2C),                      shape: RoundedRectangleBorder(                          borderRadius: BorderRadius.circular(18)),                      child: Padding(                        padding: const EdgeInsets.all(16),                        child: Column(                          crossAxisAlignment: CrossAxisAlignment.start,                          children: [                            Row(children: [                              Icon(Icons.color_lens, color: themeColor),                              const SizedBox(width: 10),                              Text(I18n.t(lang, "theme"),                                  style: const TextStyle(                                      fontWeight: FontWeight.bold, fontSize: 16)),                            ]),                            const SizedBox(height: 16),                            _selBtn(                                I18n.t(lang, "theme_blue"),                                theme == AppTheme.blue,                                Colors.blue,                                    () => app.setTheme(AppTheme.blue)),                            const SizedBox(height: 10),                            _selBtn(                                I18n.t(lang, "theme_orange"),                                theme == AppTheme.orange,                                Colors.deepOrange,                                    () => app.setTheme(AppTheme.orange)),                            const SizedBox(height: 10),                            _selBtn(                                I18n.t(lang, "theme_gray"),                                theme == AppTheme.gray,                                Colors.grey,                                    () => app.setTheme(AppTheme.gray)),                          ],                        ),                      ),                    ),                  ],                ),              ),            );          },        );      },    );  }  Widget _selBtn(String text, bool active, Color color, VoidCallback onTap) {    return ElevatedButton(      style: ElevatedButton.styleFrom(        backgroundColor: active ? color : const Color(0xFF2A2A3C),        foregroundColor: active ? Colors.white : Colors.grey,        minimumSize: const Size(double.infinity, 45),        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),        side: active            ? BorderSide.none            : const BorderSide(color: Colors.grey, width: 0.5),      ),      onPressed: onTap,      child: Text(text),    );  }}/// ===========================================================/// Setup Modal/// ===========================================================class SetupModal extends StatefulWidget {  const SetupModal({super.key});  @override  State<SetupModal> createState() => _SetupModalState();}class _SetupModalState extends State<SetupModal> {  bool scanning = false;  ScanResult? found;  StreamSubscription<List<ScanResult>>? scanSub;  final _ssid = TextEditingController();  final _pass = TextEditingController();  final _token = TextEditingController();  final _chat = TextEditingController();  bool obscure = true;  BluetoothDevice? connectedDevice;  bool connected = false;  bool saving = false;  @override  void initState() {    super.initState();    _scan();  }  @override  void dispose() {    scanSub?.cancel();    FlutterBluePlus.stopScan();    _ssid.dispose();    _pass.dispose();    _token.dispose();    _chat.dispose();    super.dispose();  }  void _scan() async {    setState(() {      scanning = true;      found = null;      connected = false;      connectedDevice = null;    });    try {      await FlutterBluePlus.startScan(timeout: const Duration(seconds: 8));      scanSub?.cancel();      scanSub = FlutterBluePlus.scanResults.listen((results) {        final matches = results.where((r) {          final name = r.device.platformName;          final hasService = r.advertisementData.serviceUuids.any(                (u) => u.toString().toLowerCase() == app.SERVICE_UUID.toLowerCase(),          );          return name == "FireAlarm" || name == "FireAlarm_Setup" || hasService;        }).toList();        if (matches.isNotEmpty && mounted) {          setState(() => found = matches.first);        }      });      Future.delayed(const Duration(seconds: 8), () async {        await FlutterBluePlus.stopScan();        if (mounted) setState(() => scanning = false);      });    } catch (_) {      if (mounted) setState(() => scanning = false);    }  }  Future<void> _loadSavedCreds(String deviceId) async {    final prefs = await SharedPreferences.getInstance();    _ssid.text = prefs.getString('${deviceId}_ssid') ?? '';    _pass.text = prefs.getString('${deviceId}_pass') ?? '';    _token.text = prefs.getString('${deviceId}_token') ?? '';    _chat.text = prefs.getString('${deviceId}_chat') ?? '';  }  Future<void> _saveCreds(String deviceId) async {    final prefs = await SharedPreferences.getInstance();    await prefs.setString('${deviceId}_ssid', _ssid.text);    await prefs.setString('${deviceId}_pass', _pass.text);    await prefs.setString('${deviceId}_token', _token.text);    await prefs.setString('${deviceId}_chat', _chat.text);  }  Future<void> _connect() async {    if (found == null) return;    final d = found!.device;    try {      try {        await d.connect(autoConnect: false);      } catch (_) {}      connectedDevice = d;      final id = d.remoteId.toString();      await _loadSavedCreds(id);      if (!mounted) return;      setState(() => connected = true);    } catch (e) {      if (!mounted) return;      ScaffoldMessenger.of(context).showSnackBar(        SnackBar(            content: Text("Connection failed: $e"),            backgroundColor: Colors.red),      );    }  }  Future<void> _sendSetupAndStart() async {    if (connectedDevice == null) return;    if (_ssid.text.isEmpty ||        _pass.text.isEmpty ||        _token.text.isEmpty ||        _chat.text.isEmpty) {      ScaffoldMessenger.of(context).showSnackBar(        const SnackBar(            content: Text("⚠️ Please fill all fields"),            backgroundColor: Colors.orange),      );      return;    }    setState(() => saving = true);    try {      final services = await connectedDevice!.discoverServices();      for (final s in services) {        if (s.uuid.toString().toLowerCase() ==            app.SERVICE_UUID.toLowerCase()) {          for (final c in s.characteristics) {            final u = c.uuid.toString().toLowerCase();            if (u == app.CHAR_SSID.toLowerCase())              await c.write(utf8.encode(_ssid.text));            if (u == app.CHAR_PASS.toLowerCase())              await c.write(utf8.encode(_pass.text));            if (u == app.CHAR_TOKEN.toLowerCase())              await c.write(utf8.encode(_token.text));            if (u == app.CHAR_CHAT.toLowerCase())              await c.write(utf8.encode(_chat.text));            if (u == app.CHAR_SAVE.toLowerCase())              await c.write(utf8.encode("SAVE"));          }        }      }      final id = connectedDevice!.remoteId.toString();      await _saveCreds(id);      if (!mounted) return;      Navigator.pop(context);      await app.connectAndStart(connectedDevice!);    } catch (e) {      if (!mounted) return;      setState(() => saving = false);      ScaffoldMessenger.of(context).showSnackBar(        SnackBar(content: Text("❌ Error: $e"), backgroundColor: Colors.red),      );    }  }  @override  Widget build(BuildContext context) {    final themeColor = app.getThemeColor();    return Container(      height: MediaQuery.of(context).size.height * 0.85,      decoration: const BoxDecoration(        color: Color(0xFF1E1E2C),        borderRadius: BorderRadius.vertical(top: Radius.circular(25)),      ),      padding: const EdgeInsets.all(16),      child: Column(        children: [          Row(            children: [              Text(                connected ? "Setup" : "Scan",                style:                const TextStyle(fontSize: 20, fontWeight: FontWeight.bold),              ),              const Spacer(),              if (scanning)                SizedBox(                    width: 18,                    height: 18,                    child: CircularProgressIndicator(                        strokeWidth: 2, color: themeColor)),              IconButton(                icon: const Icon(Icons.close),                onPressed: () => Navigator.pop(context),              )            ],          ),          const SizedBox(height: 10),          if (!connected) ...[            ElevatedButton.icon(              onPressed: scanning ? null : _scan,              icon: const Icon(Icons.search),              label: Text(scanning ? "Scanning..." : "Scan Again"),              style: ElevatedButton.styleFrom(backgroundColor: themeColor),            ),            const SizedBox(height: 12),            Expanded(              child: (found == null)                  ? const Center(                child: Text(                  "No Fire Alarm found.\nMake sure device is powered on.",                  style: TextStyle(color: Colors.grey),                  textAlign: TextAlign.center,                ),              )                  : Card(                color: const Color(0xFF2A2A3C),                child: ListTile(                  leading: Icon(Icons.security, color: themeColor),                  title: const Text("BlackBox"),                  subtitle: Text(found!.device.remoteId.toString(),                      style: const TextStyle(color: Colors.grey)),                  trailing: ElevatedButton(                    style: ElevatedButton.styleFrom(                        backgroundColor: themeColor),                    onPressed: _connect,                    child: const Text("Connect"),                  ),                ),              ),            ),          ] else ...[            const Icon(Icons.check_circle, color: Colors.green, size: 44),            const SizedBox(height: 6),            Text(I18n.t(app.langVN.value, "connected"),                style: const TextStyle(color: Colors.green)),            const SizedBox(height: 14),            Expanded(              child: SingleChildScrollView(                child: Column(                  children: [                    _field(_ssid, "WiFi SSID", Icons.wifi),                    const SizedBox(height: 10),                    _field(                      _pass,                      "WiFi Password",                      Icons.lock,                      obscure: obscure,                      suffix: IconButton(                        icon: Icon(                            obscure ? Icons.visibility : Icons.visibility_off),                        onPressed: () => setState(() => obscure = !obscure),                      ),                    ),                    const SizedBox(height: 10),                    _field(_token, "Telegram Bot Token", Icons.vpn_key),                    const SizedBox(height: 10),                    _field(_chat, "Telegram Chat ID", Icons.person),                    const SizedBox(height: 18),                    saving                        ? const CircularProgressIndicator()                        : ElevatedButton.icon(                      style: ElevatedButton.styleFrom(                          backgroundColor: Colors.green),                      onPressed: _sendSetupAndStart,                      icon: const Icon(Icons.save),                      label: const Text("SAVE & START"),                    ),                  ],                ),              ),            ),          ]        ],      ),    );  }  Widget _field(TextEditingController c, String label, IconData icon,      {bool obscure = false, Widget? suffix}) {    return TextField(      controller: c,      obscureText: obscure,      decoration: InputDecoration(        labelText: label,        prefixIcon: Icon(icon),        suffixIcon: suffix,        filled: true,        fillColor: const Color(0xFF2A2A3C),        border: OutlineInputBorder(            borderRadius: BorderRadius.circular(14),            borderSide: BorderSide.none),      ),    );  }}/// ===========================================================/// Update WiFi Modal/// ===========================================================class UpdateWifiModal extends StatefulWidget {  final BluetoothDevice device;  const UpdateWifiModal({super.key, required this.device});  @override  State<UpdateWifiModal> createState() => _UpdateWifiModalState();}class _UpdateWifiModalState extends State<UpdateWifiModal> {  final _ssid = TextEditingController();  final _pass = TextEditingController();  final _token = TextEditingController();  final _chat = TextEditingController();  bool obscure = true;  bool saving = false;  @override  void initState() {    super.initState();    _load();  }  @override  void dispose() {    _ssid.dispose();    _pass.dispose();    _token.dispose();    _chat.dispose();    super.dispose();  }  Future<void> _load() async {    final prefs = await SharedPreferences.getInstance();    final id = widget.device.remoteId.toString();    if (!mounted) return;    setState(() {      _ssid.text = prefs.getString("${id}_ssid") ?? "";      _pass.text = prefs.getString("${id}_pass") ?? "";      _token.text = prefs.getString("${id}_token") ?? "";      _chat.text = prefs.getString("${id}_chat") ?? "";    });  }  Future<void> _send() async {    if (_ssid.text.isEmpty ||        _pass.text.isEmpty ||        _token.text.isEmpty ||        _chat.text.isEmpty) {      ScaffoldMessenger.of(context).showSnackBar(        const SnackBar(            content: Text("⚠️ Please fill all fields"),            backgroundColor: Colors.orange),      );      return;    }    setState(() => saving = true);    try {      try {        await widget.device.connect(autoConnect: false);      } catch (e) {}      final id = widget.device.remoteId.toString();      final services = await widget.device.discoverServices();      Future<void> writeAll(          String ssid, String pass, String token, String chat) async {        for (final s in services) {          if (s.uuid.toString().toLowerCase() ==              app.SERVICE_UUID.toLowerCase()) {            for (final c in s.characteristics) {              final u = c.uuid.toString().toLowerCase();              if (u == app.CHAR_SSID.toLowerCase())                await c.write(utf8.encode(ssid));              if (u == app.CHAR_PASS.toLowerCase())                await c.write(utf8.encode(pass));              if (u == app.CHAR_TOKEN.toLowerCase())                await c.write(utf8.encode(token));              if (u == app.CHAR_CHAT.toLowerCase())                await c.write(utf8.encode(chat));            }          }        }      }      Future<void> pressSave() async {        for (final s in services) {          if (s.uuid.toString().toLowerCase() ==              app.SERVICE_UUID.toLowerCase()) {            for (final c in s.characteristics) {              if (c.uuid.toString().toLowerCase() ==                  app.CHAR_SAVE.toLowerCase()) {                await c.write(utf8.encode("SAVE"));              }            }          }        }      }      await writeAll("", "", "", "");      await pressSave();      await writeAll(_ssid.text, _pass.text, _token.text, _chat.text);      await pressSave();      final prefs = await SharedPreferences.getInstance();      await prefs.setString("${id}_ssid", _ssid.text);      await prefs.setString("${id}_pass", _pass.text);      await prefs.setString("${id}_token", _token.text);      await prefs.setString("${id}_chat", _chat.text);      app.wifiSsid = _ssid.text.trim();      app.wifiIp = "";      app.netStatus = NetStatus.unknown;      app.liveTick.value++;      if (!mounted) return;      setState(() => saving = false);      Navigator.pop(context);      ScaffoldMessenger.of(context).showSnackBar(        const SnackBar(            content: Text("✅ WiFi settings updated!"),            backgroundColor: Colors.green),      );    } catch (e) {      if (!mounted) return;      setState(() => saving = false);      ScaffoldMessenger.of(context).showSnackBar(        SnackBar(content: Text("❌ Error: $e"), backgroundColor: Colors.red),      );    }  }  @override  Widget build(BuildContext context) {    return Container(      height: MediaQuery.of(context).size.height * 0.75,      decoration: const BoxDecoration(        color: Color(0xFF1E1E2C),        borderRadius: BorderRadius.vertical(top: Radius.circular(25)),      ),      padding: const EdgeInsets.all(16),      child: Column(        children: [          Row(            children: [              const Text("Update WiFi Settings",                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),              const Spacer(),              IconButton(                  icon: const Icon(Icons.close),                  onPressed: () => Navigator.pop(context)),            ],          ),          const SizedBox(height: 10),          Expanded(            child: SingleChildScrollView(              child: Column(                children: [                  _field(_ssid, "WiFi SSID", Icons.wifi),                  const SizedBox(height: 10),                  _field(                    _pass,                    "WiFi Password",                    Icons.lock,                    obscure: obscure,                    suffix: IconButton(                      icon: Icon(                          obscure ? Icons.visibility : Icons.visibility_off),                      onPressed: () => setState(() => obscure = !obscure),                    ),                  ),                  const SizedBox(height: 10),                  _field(_token, "Telegram Bot Token", Icons.vpn_key),                  const SizedBox(height: 10),                  _field(_chat, "Telegram Chat ID", Icons.person),                  const SizedBox(height: 18),                  saving                      ? const CircularProgressIndicator()                      : ElevatedButton.icon(                    style: ElevatedButton.styleFrom(                        backgroundColor: Colors.green),                    onPressed: _send,                    icon: const Icon(Icons.save),                    label: const Text("UPDATE"),                  ),                ],              ),            ),          ),        ],      ),    );  }  Widget _field(TextEditingController c, String label, IconData icon,      {bool obscure = false, Widget? suffix}) {    return TextField(      controller: c,      obscureText: obscure,      decoration: InputDecoration(        labelText: label,        prefixIcon: Icon(icon),        suffixIcon: suffix,        filled: true,        fillColor: const Color(0xFF2A2A3C),        border: OutlineInputBorder(            borderRadius: BorderRadius.circular(14),            borderSide: BorderSide.none),      ),    );  }}
+import 'dart:async';
+import 'dart:convert';
+
+import 'package:flutter/material.dart';
+import 'package:flutter_blue_plus/flutter_blue_plus.dart';
+import 'package:permission_handler/permission_handler.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+
+void main() {
+  runApp(const FireGuardianApp());
+}
+
+/// ==========================
+/// Enums: Language & Theme
+/// ==========================
+enum AppLang { en, zh }
+enum AppTheme { blue, orange, gray }
+
+class I18n {
+  static const _map = {
+    "app_title": {AppLang.en: "BlackBox", AppLang.zh: "BlackBox"},
+    "home": {AppLang.en: "Home", AppLang.zh: "首頁"},
+    "settings": {AppLang.en: "Settings", AppLang.zh: "設定"},
+    "scan_connect": {AppLang.en: "Scan & Connect", AppLang.zh: "掃描並連線"},
+    "connected": {AppLang.en: "Connected", AppLang.zh: "已連線"},
+    "not_connected": {AppLang.en: "Not connected", AppLang.zh: "未連線"},
+    "status_safe": {AppLang.en: "SAFE", AppLang.zh: "安全"},
+    "status_warning": {AppLang.en: "WARNING", AppLang.zh: "警告"},
+    "smoke": {AppLang.en: "Smoke", AppLang.zh: "煙霧"},
+    "fire": {AppLang.en: "Fire", AppLang.zh: "火焰"},
+    "smoke_limit": {AppLang.en: "Smoke Limit", AppLang.zh: "煙霧閾值"},
+    "flame_limit": {AppLang.en: "Flame Limit", AppLang.zh: "火焰閾值"},
+    "update_wifi": {AppLang.en: "Update WiFi Settings", AppLang.zh: "更新 WiFi 設定"},
+    "language": {AppLang.en: "Language", AppLang.zh: "語言"},
+    "theme": {AppLang.en: "Theme", AppLang.zh: "主題"},
+    "theme_blue": {AppLang.en: "Black Blue", AppLang.zh: "黑藍色"},
+    "theme_orange": {AppLang.en: "Black Orange", AppLang.zh: "黑橘色"},
+    "theme_gray": {AppLang.en: "Black Gray", AppLang.zh: "黑灰色"},
+  };
+
+  static String t(AppLang lang, String key) => _map[key]?[lang] ?? key;
+}
+
+/// ==========================
+/// Internet status
+/// ==========================
+enum NetStatus {
+  unknown, // waiting for WIFI_OK / WIFI_FAIL
+  online, // WIFI_OK
+  offlineNoInternet, // WIFI_FAIL
+  offlineNoWifiSaved, // no SSID saved locally
+}
+
+/// ===========================================================
+/// App State
+/// ===========================================================
+class AppState extends ChangeNotifier {
+  // ===== UUIDs =====
+  final String SERVICE_UUID = "4fafc201-1fb5-459e-8fcc-c5c9c331914b";
+  final String CHAR_SSID = "beb5483e-36e1-4688-b7f5-ea07361b26a8";
+  final String CHAR_PASS = "889e2486-2598-444f-954f-173627096756";
+  final String CHAR_TOKEN = "12345678-1234-1234-1234-1234567890ab";
+  final String CHAR_CHAT = "87654321-4321-4321-4321-ba0987654321";
+  final String CHAR_SAVE = "cafebabe-cafe-cafe-cafe-cafebabecafe";
+
+  final String SMOKE_CHAR = "cafebabe-cafe-cafe-cafe-cafebabecaf1";
+  final String FLAME_CHAR = "cafebabe-cafe-cafe-cafe-cafebabecaf2";
+  final String NOTIFY_CHAR = "cafebabe-cafe-cafe-cafe-cafebabecafd";
+
+  // ===== Notifiers =====
+  final ValueNotifier<AppLang> langVN = ValueNotifier(AppLang.en);
+  final ValueNotifier<AppTheme> themeVN = ValueNotifier(AppTheme.blue);
+
+  final ValueNotifier<int> liveTick = ValueNotifier(0);
+  final ValueNotifier<int> navVN = ValueNotifier(0);
+
+  // ===== Device / Live values =====
+  BluetoothDevice? device;
+  bool ready = false;
+
+  int smokeVal = 0;
+  int flameVal = 0;
+
+  double smokeLimit = 2000;
+  double flameLimit = 150;
+
+  BluetoothCharacteristic? _smokeChar;
+  BluetoothCharacteristic? _flameChar;
+  BluetoothCharacteristic? _notifyChar;
+
+  StreamSubscription<List<int>>? _notifySub;
+
+  NetStatus netStatus = NetStatus.unknown;
+  String wifiSsid = "";
+  String wifiIp = "";
+
+  DateTime _lastUi = DateTime.fromMillisecondsSinceEpoch(0);
+
+  Future<void> init() async {
+    final prefs = await SharedPreferences.getInstance();
+    final l = prefs.getString("lang") ?? "en";
+    langVN.value = (l == "zh") ? AppLang.zh : AppLang.en;
+
+    final t = prefs.getString("theme") ?? "blue";
+    if (t == "orange") themeVN.value = AppTheme.orange;
+    else if (t == "gray") themeVN.value = AppTheme.gray;
+    else themeVN.value = AppTheme.blue;
+  }
+
+  Future<void> setLang(AppLang l) async {
+    langVN.value = l;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString("lang", l == AppLang.zh ? "zh" : "en");
+  }
+
+  Future<void> setTheme(AppTheme t) async {
+    themeVN.value = t;
+    final prefs = await SharedPreferences.getInstance();
+    String val = "blue";
+    if (t == AppTheme.orange) val = "orange";
+    if (t == AppTheme.gray) val = "gray";
+    await prefs.setString("theme", val);
+  }
+
+  Color getThemeColor() {
+    switch (themeVN.value) {
+      case AppTheme.orange: return Colors.deepOrange;
+      case AppTheme.gray: return Colors.grey;
+      case AppTheme.blue:
+      default: return Colors.blue;
+    }
+  }
+
+  Future<void> _loadSavedWifiForDevice(String deviceId) async {
+    final prefs = await SharedPreferences.getInstance();
+    wifiSsid = prefs.getString('${deviceId}_ssid') ?? '';
+    wifiIp = "";
+
+    if (wifiSsid.trim().isEmpty) {
+      netStatus = NetStatus.offlineNoWifiSaved;
+    } else {
+      netStatus = NetStatus.unknown;
+    }
+  }
+
+  Future<void> connectAndStart(BluetoothDevice d) async {
+    device = d;
+    ready = false;
+    navVN.value = 0;
+
+    await _loadSavedWifiForDevice(d.remoteId.toString());
+    liveTick.value++;
+    notifyListeners();
+
+    try {
+      await _discoverServicesAndListen().timeout(
+          const Duration(seconds: 6),
+          onTimeout: () {
+            print("Discovery timed out, forcing ready.");
+            return;
+          }
+      );
+    } catch (e) {
+      print("Error during connection: $e");
+    } finally {
+      ready = true;
+      liveTick.value++;
+      notifyListeners();
+    }
+  }
+
+  void _handleNotifyMessage(String msg) {
+    bool urgentUpdate = false;
+    if (msg == "WIFI_OK") {
+      netStatus = NetStatus.online;
+      urgentUpdate = true;
+    } else if (msg == "WIFI_FAIL") {
+      if (wifiSsid.trim().isEmpty) {
+        netStatus = NetStatus.offlineNoWifiSaved;
+      } else {
+        netStatus = NetStatus.offlineNoInternet;
+      }
+      urgentUpdate = true;
+    } else if (msg.startsWith("SSID:")) {
+      wifiSsid = msg.substring(5).trim();
+      if (wifiSsid == "<none>") wifiSsid = "";
+      urgentUpdate = true;
+    } else if (msg.startsWith("IP:")) {
+      wifiIp = msg.substring(3).trim();
+      urgentUpdate = true;
+    } else if (msg.startsWith("LIVE:")) {
+      final parts = msg.split(":");
+      if (parts.length >= 3) {
+        smokeVal = int.tryParse(parts[1]) ?? 0;
+        flameVal = int.tryParse(parts[2]) ?? 0;
+        final now = DateTime.now();
+        if (now.difference(_lastUi).inMilliseconds >= 200) {
+          _lastUi = now;
+          liveTick.value++;
+        }
+      }
+      return;
+    }
+    if (urgentUpdate) {
+      liveTick.value++;
+      notifyListeners();
+    }
+  }
+
+  Future<void> _discoverServicesAndListen() async {
+    if (device == null) return;
+
+    List<BluetoothService> services = [];
+    try {
+      services = await device!.discoverServices();
+    } catch (e) {
+      return;
+    }
+
+    _smokeChar = null;
+    _flameChar = null;
+    _notifyChar = null;
+
+    for (final s in services) {
+      for (final c in s.characteristics) {
+        final uuid = c.uuid.toString().toLowerCase();
+        if (uuid == SMOKE_CHAR) _smokeChar = c;
+        if (uuid == FLAME_CHAR) _flameChar = c;
+        if (uuid == NOTIFY_CHAR) _notifyChar = c;
+      }
+    }
+
+    // LOAD SAVED LIMITS
+    final prefs = await SharedPreferences.getInstance();
+    final id = device!.remoteId.toString();
+    smokeLimit = prefs.getDouble('${id}_smoke_limit') ?? 2000.0;
+    flameLimit = prefs.getDouble('${id}_flame_limit') ?? 150.0;
+
+    if (_notifyChar != null) {
+      await _notifyChar!.setNotifyValue(true);
+      await _notifySub?.cancel();
+      _notifySub = _notifyChar!.onValueReceived.listen((value) {
+        final msg = utf8.decode(value);
+        _handleNotifyMessage(msg);
+      });
+    }
+
+    // WRITE SAVED LIMITS TO DEVICE
+    try {
+      await writeLimits(smokeLimit, flameLimit);
+    } catch (_) {}
+
+    notifyListeners();
+  }
+
+  Future<void> writeLimits(double smoke, double flame) async {
+    smokeLimit = smoke;
+    flameLimit = flame;
+    if (_smokeChar != null) {
+      await _smokeChar!.write(utf8.encode(smoke.toInt().toString()));
+    }
+    if (_flameChar != null) {
+      await _flameChar!.write(utf8.encode(flame.toInt().toString()));
+    }
+    if (device != null) {
+      final prefs = await SharedPreferences.getInstance();
+      final id = device!.remoteId.toString();
+      await prefs.setDouble('${id}_smoke_limit', smokeLimit);
+      await prefs.setDouble('${id}_flame_limit', flameLimit);
+    }
+    liveTick.value++;
+  }
+
+  Future<void> disconnect() async {
+    try {
+      await _notifySub?.cancel();
+      _notifySub = null;
+      await device?.disconnect();
+    } catch (_) {}
+    device = null;
+    ready = false;
+    netStatus = NetStatus.unknown;
+    wifiSsid = "";
+    wifiIp = "";
+    liveTick.value++;
+    notifyListeners();
+  }
+}
+
+final AppState app = AppState();
+
+/// ===========================================================
+/// App
+/// ===========================================================
+class FireGuardianApp extends StatefulWidget {
+  const FireGuardianApp({super.key});
+
+  @override
+  State<FireGuardianApp> createState() => _FireGuardianAppState();
+}
+
+class _FireGuardianAppState extends State<FireGuardianApp> {
+  @override
+  void initState() {
+    super.initState();
+    _init();
+  }
+
+  Future<void> _init() async {
+    await [
+      Permission.location,
+      Permission.bluetoothScan,
+      Permission.bluetoothConnect,
+      Permission.bluetoothAdvertise,
+    ].request();
+    await app.init();
+    if (mounted) setState(() {});
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return ValueListenableBuilder<AppLang>(
+      valueListenable: app.langVN,
+      builder: (_, lang, __) {
+        return ValueListenableBuilder<AppTheme>(
+          valueListenable: app.themeVN,
+          builder: (_, theme, ___) {
+            Color primaryColor = Colors.blue;
+            if (theme == AppTheme.orange) primaryColor = Colors.deepOrange;
+            if (theme == AppTheme.gray) primaryColor = Colors.grey;
+
+            return MaterialApp(
+              title: I18n.t(lang, "app_title"),
+              debugShowCheckedModeBanner: false,
+              theme: ThemeData(
+                  brightness: Brightness.dark,
+                  primaryColor: primaryColor,
+                  scaffoldBackgroundColor: const Color(0xFF121212),
+                  useMaterial3: true,
+                  colorScheme: ColorScheme.dark(
+                    primary: primaryColor,
+                    secondary: primaryColor,
+                  ),
+                  elevatedButtonTheme: ElevatedButtonThemeData(
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: primaryColor,
+                        foregroundColor: Colors.white,
+                      )),
+                  sliderTheme: SliderThemeData(
+                    activeTrackColor: primaryColor,
+                    thumbColor: primaryColor,
+                  )),
+              home: const DrawerShell(),
+            );
+          },
+        );
+      },
+    );
+  }
+}
+
+/// ===========================================================
+/// Drawer Shell
+/// ===========================================================
+class DrawerShell extends StatefulWidget {
+  const DrawerShell({super.key});
+
+  @override
+  State<DrawerShell> createState() => _DrawerShellState();
+}
+
+class _DrawerShellState extends State<DrawerShell> {
+  int idx = 0;
+  late VoidCallback _navListener;
+
+  @override
+  void initState() {
+    super.initState();
+    _navListener = () {
+      if (!mounted) return;
+      setState(() => idx = app.navVN.value);
+    };
+    app.navVN.addListener(_navListener);
+  }
+
+  @override
+  void dispose() {
+    app.navVN.removeListener(_navListener);
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return ValueListenableBuilder<AppLang>(
+      valueListenable: app.langVN,
+      builder: (_, lang, __) {
+        final themeColor = app.getThemeColor();
+
+        final pages = const [
+          HomePage(),
+          SettingsPage(),
+        ];
+
+        final titles = [
+          I18n.t(lang, "home"),
+          I18n.t(lang, "settings"),
+        ];
+
+        if (idx >= pages.length) idx = 0;
+
+        return Scaffold(
+          appBar: AppBar(
+            title: Text("🔥 ${titles[idx]}"),
+            centerTitle: true,
+            backgroundColor: Colors.transparent,
+          ),
+          drawer: Drawer(
+            backgroundColor: const Color(0xFF1E1E2C),
+            child: ValueListenableBuilder<int>(
+              valueListenable: app.liveTick,
+              builder: (_, __, ___) {
+                final connected = app.device != null;
+                final ssid =
+                app.wifiSsid.trim().isEmpty ? "<none>" : app.wifiSsid.trim();
+                final online = app.netStatus == NetStatus.online;
+
+                String sub = connected
+                    ? "${I18n.t(lang, "connected")}: ${app.device!.remoteId}"
+                    : I18n.t(lang, "not_connected");
+
+                if (connected) {
+                  sub += "\nWiFi: $ssid • ${online ? "ONLINE" : "OFFLINE"}";
+                  if (online && app.wifiIp.trim().isNotEmpty) {
+                    sub += "\nIP: ${app.wifiIp}";
+                  }
+                }
+
+                return Column(
+                  children: [
+                    const SizedBox(height: 40),
+                    ListTile(
+                      leading: Icon(Icons.local_fire_department, color: themeColor),
+                      title: Text(
+                        I18n.t(lang, "app_title"),
+                        style: const TextStyle(
+                            fontWeight: FontWeight.bold, fontSize: 18),
+                      ),
+                      subtitle: Text(
+                        sub,
+                        style: const TextStyle(color: Colors.grey),
+                      ),
+                    ),
+                    const Divider(color: Colors.grey),
+                    _drawerItem(Icons.home_rounded, I18n.t(lang, "home"), 0,
+                        themeColor),
+                    _drawerItem(Icons.settings_rounded, I18n.t(lang, "settings"),
+                        1, themeColor),
+                    const Spacer(),
+                    Padding(
+                      padding: const EdgeInsets.all(14),
+                      child: ElevatedButton.icon(
+                        style: ElevatedButton.styleFrom(
+                          minimumSize: const Size(double.infinity, 52),
+                          shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(14)),
+                        ),
+                        onPressed: () => _openSetupModal(context),
+                        icon: const Icon(Icons.bluetooth_searching),
+                        label: Text(I18n.t(lang, "scan_connect")),
+                      ),
+                    ),
+                    const SizedBox(height: 10),
+                  ],
+                );
+              },
+            ),
+          ),
+          body: pages[idx],
+        );
+      },
+    );
+  }
+
+  Widget _drawerItem(IconData icon, String title, int targetIdx, Color color) {
+    final selected = idx == targetIdx;
+    return ListTile(
+      leading: Icon(icon, color: selected ? color : Colors.grey),
+      title:
+      Text(title, style: TextStyle(color: selected ? color : Colors.white)),
+      selected: selected,
+      onTap: () {
+        app.navVN.value = targetIdx;
+        Navigator.pop(context);
+      },
+    );
+  }
+
+  void _openSetupModal(BuildContext context) {
+    Navigator.pop(context);
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      isDismissible: false,
+      backgroundColor: Colors.transparent,
+      builder: (_) => const SetupModal(),
+    );
+  }
+}
+
+/// ===========================================================
+/// Page 1: Home
+/// ===========================================================
+class HomePage extends StatefulWidget {
+  const HomePage({super.key});
+
+  @override
+  State<HomePage> createState() => _HomePageState();
+}
+
+class _HomePageState extends State<HomePage> {
+  double _smokeTmp = app.smokeLimit;
+  double _flameTmp = app.flameLimit;
+  String? _lastDeviceId;
+  bool _valuesSynced = false;
+
+  void _syncTmpIfDeviceChanged() {
+    final id = app.device?.remoteId.toString();
+
+    // If device ID changed, reset our sync flag
+    if (id != _lastDeviceId) {
+      _lastDeviceId = id;
+      _valuesSynced = false;
+    }
+
+    // If we are connected & ready, but haven't synced saved values yet, do it now.
+    if (app.ready && !_valuesSynced) {
+      _smokeTmp = app.smokeLimit;
+      _flameTmp = app.flameLimit;
+      _valuesSynced = true;
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    _syncTmpIfDeviceChanged();
+    final lang = app.langVN.value;
+    final themeColor = app.getThemeColor();
+
+    // FIXED: Added SingleChildScrollView to allow scrolling in landscape/small screens
+    return SingleChildScrollView(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: ValueListenableBuilder<int>(
+            valueListenable: app.liveTick,
+            builder: (_, __, ___) {
+              _syncTmpIfDeviceChanged();
+
+              final connected = app.device != null;
+              final ready = app.ready;
+
+              final baseStatus = (!connected)
+                  ? I18n.t(lang, "not_connected")
+                  : (app.smokeVal > app.smokeLimit
+                  ? I18n.t(lang, "status_warning")
+                  : I18n.t(lang, "status_safe"));
+
+              final online = (app.netStatus == NetStatus.online);
+              final statusColor = (!connected)
+                  ? Colors.grey
+                  : (baseStatus == I18n.t(lang, "status_safe")
+                  ? Colors.green
+                  : Colors.orange);
+
+              return Column(
+                children: [
+                  Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.all(16),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF1E1E2C),
+                      borderRadius: BorderRadius.circular(20),
+                      border: Border.all(color: statusColor.withOpacity(0.35)),
+                    ),
+                    child: Row(
+                      children: [
+                        CircleAvatar(
+                          backgroundColor: statusColor.withOpacity(0.18),
+                          child: Icon(
+                            connected
+                                ? Icons.verified_rounded
+                                : Icons.bluetooth_disabled_rounded,
+                            color: statusColor,
+                          ),
+                        ),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: Text(
+                            baseStatus,
+                            style: TextStyle(
+                                fontSize: 18,
+                                fontWeight: FontWeight.bold,
+                                color: statusColor),
+                          ),
+                        ),
+                        Text(
+                          connected ? (online ? "ONLINE" : "OFFLINE") : "OFFLINE",
+                          style: TextStyle(
+                            color: connected
+                                ? (online ? Colors.green : Colors.orange)
+                                : Colors.grey,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 14),
+                  // REMOVED Expanded to allow scrolling. Card will take natural height.
+                  Card(
+                    color: const Color(0xFF1E1E2C),
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+                    child: Padding(
+                      padding: const EdgeInsets.all(16),
+                      child: (!connected)
+                          ? Center(
+                        child: Padding(
+                          padding: const EdgeInsets.symmetric(vertical: 40),
+                          child: Text(
+                            "Open sidebar → ${I18n.t(lang, "scan_connect")}",
+                            style: const TextStyle(color: Colors.grey),
+                            textAlign: TextAlign.center,
+                          ),
+                        ),
+                      )
+                          : (!ready)
+                          ? Center(
+                        child: Padding(
+                          padding: const EdgeInsets.symmetric(vertical: 40),
+                          child: Column(
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            children: [
+                              CircularProgressIndicator(color: themeColor),
+                              const SizedBox(height: 16),
+                              const Text("Syncing...", style: TextStyle(color: Colors.grey)),
+                            ],
+                          ),
+                        ),
+                      )
+                          : Column(
+                        children: [
+                          Row(
+                            children: [
+                              Expanded(
+                                child: _gauge(
+                                  title: I18n.t(lang, "smoke"),
+                                  value: app.smokeVal,
+                                  icon: Icons.cloud_rounded,
+                                  danger: app.smokeVal > app.smokeLimit,
+                                ),
+                              ),
+                              const SizedBox(width: 12),
+                              Expanded(
+                                child: _gauge(
+                                  title: I18n.t(lang, "fire"),
+                                  value: app.flameVal,
+                                  icon: Icons.local_fire_department_rounded,
+                                  danger: app.flameVal < app.flameLimit,
+                                ),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 18),
+                          _slider(
+                            label: I18n.t(lang, "smoke_limit"),
+                            value: _smokeTmp,
+                            onChanged: (v) => setState(() => _smokeTmp = v),
+                            onChangeEnd: (v) => app.writeLimits(v, _flameTmp),
+                          ),
+                          const SizedBox(height: 10),
+                          _slider(
+                            label: I18n.t(lang, "flame_limit"),
+                            value: _flameTmp,
+                            onChanged: (v) => setState(() => _flameTmp = v),
+                            onChangeEnd: (v) => app.writeLimits(_smokeTmp, v),
+                          ),
+                          const SizedBox(height: 20), // Replaced Spacer with fixed height
+                          ElevatedButton.icon(
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: themeColor,
+                              minimumSize: const Size(double.infinity, 52),
+                              shape: RoundedRectangleBorder(
+                                  borderRadius: BorderRadius.circular(14)),
+                            ),
+                            onPressed: () => showModalBottomSheet(
+                              context: context,
+                              isScrollControlled: true,
+                              backgroundColor: Colors.transparent,
+                              builder: (_) =>
+                                  UpdateWifiModal(device: app.device!),
+                            ),
+                            icon: const Icon(Icons.wifi),
+                            label: Text(I18n.t(lang, "update_wifi")),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ],
+              );
+            }
+        ),
+      ),
+    );
+  }
+
+  Widget _gauge({
+    required String title,
+    required int value,
+    required IconData icon,
+    required bool danger,
+  }) {
+    return Container(
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: const Color(0xFF2A2A3C),
+        borderRadius: BorderRadius.circular(18),
+        border: danger ? Border.all(color: Colors.red, width: 2) : null,
+      ),
+      child: Column(
+        children: [
+          Icon(icon, color: danger ? Colors.red : Colors.grey, size: 28),
+          const SizedBox(height: 8),
+          Text(title, style: const TextStyle(color: Colors.grey)),
+          const SizedBox(height: 4),
+          Text("$value",
+              style: const TextStyle(fontSize: 26, fontWeight: FontWeight.bold)),
+        ],
+      ),
+    );
+  }
+
+  Widget _slider({
+    required String label,
+    required double value,
+    required ValueChanged<double> onChanged,
+    required ValueChanged<double> onChangeEnd,
+  }) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(children: [
+          Text(label),
+          const Spacer(),
+          Text(value.toInt().toString(),
+              style: const TextStyle(color: Colors.grey)),
+        ]),
+        Slider(
+          value: value.clamp(0, 4095),
+          min: 0,
+          max: 4095,
+          onChanged: onChanged,
+          onChangeEnd: onChangeEnd,
+        ),
+      ],
+    );
+  }
+}
+
+/// ===========================================================
+/// Page 2: Settings (Theme & Language)
+/// ===========================================================
+class SettingsPage extends StatelessWidget {
+  const SettingsPage({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return ValueListenableBuilder<AppLang>(
+      valueListenable: app.langVN,
+      builder: (_, lang, __) {
+        return ValueListenableBuilder<AppTheme>(
+          valueListenable: app.themeVN,
+          builder: (_, theme, ___) {
+            final themeColor = app.getThemeColor();
+
+            // FIXED: Added SingleChildScrollView to allow scrolling in landscape/small screens
+            return SingleChildScrollView(
+              child: Padding(
+                padding: const EdgeInsets.all(16),
+                child: Column(
+                  children: [
+                    Card(
+                      color: const Color(0xFF1E1E2C),
+                      shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(18)),
+                      child: Padding(
+                        padding: const EdgeInsets.all(16),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Row(children: [
+                              Icon(Icons.language, color: themeColor),
+                              const SizedBox(width: 10),
+                              Text(I18n.t(lang, "language"),
+                                  style: const TextStyle(
+                                      fontWeight: FontWeight.bold, fontSize: 16)),
+                            ]),
+                            const SizedBox(height: 16),
+                            Row(
+                              children: [
+                                Expanded(
+                                  child: _selBtn("English", lang == AppLang.en,
+                                      themeColor, () => app.setLang(AppLang.en)),
+                                ),
+                                const SizedBox(width: 10),
+                                Expanded(
+                                  child: _selBtn("中文", lang == AppLang.zh,
+                                      themeColor, () => app.setLang(AppLang.zh)),
+                                ),
+                              ],
+                            )
+                          ],
+                        ),
+                      ),
+                    ),
+
+                    const SizedBox(height: 16),
+
+                    Card(
+                      color: const Color(0xFF1E1E2C),
+                      shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(18)),
+                      child: Padding(
+                        padding: const EdgeInsets.all(16),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Row(children: [
+                              Icon(Icons.color_lens, color: themeColor),
+                              const SizedBox(width: 10),
+                              Text(I18n.t(lang, "theme"),
+                                  style: const TextStyle(
+                                      fontWeight: FontWeight.bold, fontSize: 16)),
+                            ]),
+                            const SizedBox(height: 16),
+                            _selBtn(
+                                I18n.t(lang, "theme_blue"),
+                                theme == AppTheme.blue,
+                                Colors.blue,
+                                    () => app.setTheme(AppTheme.blue)),
+                            const SizedBox(height: 10),
+                            _selBtn(
+                                I18n.t(lang, "theme_orange"),
+                                theme == AppTheme.orange,
+                                Colors.deepOrange,
+                                    () => app.setTheme(AppTheme.orange)),
+                            const SizedBox(height: 10),
+                            _selBtn(
+                                I18n.t(lang, "theme_gray"),
+                                theme == AppTheme.gray,
+                                Colors.grey,
+                                    () => app.setTheme(AppTheme.gray)),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+
+  Widget _selBtn(String text, bool active, Color color, VoidCallback onTap) {
+    return ElevatedButton(
+      style: ElevatedButton.styleFrom(
+        backgroundColor: active ? color : const Color(0xFF2A2A3C),
+        foregroundColor: active ? Colors.white : Colors.grey,
+        minimumSize: const Size(double.infinity, 45),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+        side: active
+            ? BorderSide.none
+            : const BorderSide(color: Colors.grey, width: 0.5),
+      ),
+      onPressed: onTap,
+      child: Text(text),
+    );
+  }
+}
+
+/// ===========================================================
+/// Setup Modal
+/// ===========================================================
+class SetupModal extends StatefulWidget {
+  const SetupModal({super.key});
+
+  @override
+  State<SetupModal> createState() => _SetupModalState();
+}
+
+class _SetupModalState extends State<SetupModal> {
+  bool scanning = false;
+  ScanResult? found;
+  StreamSubscription<List<ScanResult>>? scanSub;
+
+  final _ssid = TextEditingController();
+  final _pass = TextEditingController();
+  final _token = TextEditingController();
+  final _chat = TextEditingController();
+  bool obscure = true;
+
+  BluetoothDevice? connectedDevice;
+  bool connected = false;
+  bool saving = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _scan();
+  }
+
+  @override
+  void dispose() {
+    scanSub?.cancel();
+    FlutterBluePlus.stopScan();
+    _ssid.dispose();
+    _pass.dispose();
+    _token.dispose();
+    _chat.dispose();
+    super.dispose();
+  }
+
+  void _scan() async {
+    setState(() {
+      scanning = true;
+      found = null;
+      connected = false;
+      connectedDevice = null;
+    });
+
+    try {
+      await FlutterBluePlus.startScan(timeout: const Duration(seconds: 8));
+
+      scanSub?.cancel();
+      scanSub = FlutterBluePlus.scanResults.listen((results) {
+        final matches = results.where((r) {
+          final name = r.device.platformName;
+          final hasService = r.advertisementData.serviceUuids.any(
+                (u) => u.toString().toLowerCase() == app.SERVICE_UUID.toLowerCase(),
+          );
+          return name == "FireAlarm" || name == "FireAlarm_Setup" || hasService;
+        }).toList();
+
+        if (matches.isNotEmpty && mounted) {
+          setState(() => found = matches.first);
+        }
+      });
+
+      Future.delayed(const Duration(seconds: 8), () async {
+        await FlutterBluePlus.stopScan();
+        if (mounted) setState(() => scanning = false);
+      });
+    } catch (_) {
+      if (mounted) setState(() => scanning = false);
+    }
+  }
+
+  Future<void> _loadSavedCreds(String deviceId) async {
+    final prefs = await SharedPreferences.getInstance();
+    _ssid.text = prefs.getString('${deviceId}_ssid') ?? '';
+    _pass.text = prefs.getString('${deviceId}_pass') ?? '';
+    _token.text = prefs.getString('${deviceId}_token') ?? '';
+    _chat.text = prefs.getString('${deviceId}_chat') ?? '';
+  }
+
+  Future<void> _saveCreds(String deviceId) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('${deviceId}_ssid', _ssid.text);
+    await prefs.setString('${deviceId}_pass', _pass.text);
+    await prefs.setString('${deviceId}_token', _token.text);
+    await prefs.setString('${deviceId}_chat', _chat.text);
+  }
+
+  Future<void> _connect() async {
+    if (found == null) return;
+    final d = found!.device;
+
+    try {
+      try {
+        await d.connect(autoConnect: false);
+      } catch (_) {}
+
+      connectedDevice = d;
+      final id = d.remoteId.toString();
+      await _loadSavedCreds(id);
+
+      if (!mounted) return;
+      setState(() => connected = true);
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+            content: Text("Connection failed: $e"),
+            backgroundColor: Colors.red),
+      );
+    }
+  }
+
+  Future<void> _sendSetupAndStart() async {
+    if (connectedDevice == null) return;
+    if (_ssid.text.isEmpty ||
+        _pass.text.isEmpty ||
+        _token.text.isEmpty ||
+        _chat.text.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+            content: Text("⚠️ Please fill all fields"),
+            backgroundColor: Colors.orange),
+      );
+      return;
+    }
+    setState(() => saving = true);
+
+    try {
+      final services = await connectedDevice!.discoverServices();
+      for (final s in services) {
+        if (s.uuid.toString().toLowerCase() ==
+            app.SERVICE_UUID.toLowerCase()) {
+          for (final c in s.characteristics) {
+            final u = c.uuid.toString().toLowerCase();
+            if (u == app.CHAR_SSID.toLowerCase())
+              await c.write(utf8.encode(_ssid.text));
+            if (u == app.CHAR_PASS.toLowerCase())
+              await c.write(utf8.encode(_pass.text));
+            if (u == app.CHAR_TOKEN.toLowerCase())
+              await c.write(utf8.encode(_token.text));
+            if (u == app.CHAR_CHAT.toLowerCase())
+              await c.write(utf8.encode(_chat.text));
+            if (u == app.CHAR_SAVE.toLowerCase())
+              await c.write(utf8.encode("SAVE"));
+          }
+        }
+      }
+
+      final id = connectedDevice!.remoteId.toString();
+      await _saveCreds(id);
+
+      if (!mounted) return;
+
+      Navigator.pop(context);
+
+      await app.connectAndStart(connectedDevice!);
+
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => saving = false);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text("❌ Error: $e"), backgroundColor: Colors.red),
+      );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final themeColor = app.getThemeColor();
+
+    return Container(
+      height: MediaQuery.of(context).size.height * 0.85,
+      decoration: const BoxDecoration(
+        color: Color(0xFF1E1E2C),
+        borderRadius: BorderRadius.vertical(top: Radius.circular(25)),
+      ),
+      padding: const EdgeInsets.all(16),
+      child: Column(
+        children: [
+          Row(
+            children: [
+              Text(
+                connected ? "Setup" : "Scan",
+                style:
+                const TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+              ),
+              const Spacer(),
+              if (scanning)
+                SizedBox(
+                    width: 18,
+                    height: 18,
+                    child: CircularProgressIndicator(
+                        strokeWidth: 2, color: themeColor)),
+              IconButton(
+                icon: const Icon(Icons.close),
+                onPressed: () => Navigator.pop(context),
+              )
+            ],
+          ),
+          const SizedBox(height: 10),
+          if (!connected) ...[
+            ElevatedButton.icon(
+              onPressed: scanning ? null : _scan,
+              icon: const Icon(Icons.search),
+              label: Text(scanning ? "Scanning..." : "Scan Again"),
+              style: ElevatedButton.styleFrom(backgroundColor: themeColor),
+            ),
+            const SizedBox(height: 12),
+            Expanded(
+              child: (found == null)
+                  ? const Center(
+                child: Text(
+                  "No Fire Alarm found.\nMake sure device is powered on.",
+                  style: TextStyle(color: Colors.grey),
+                  textAlign: TextAlign.center,
+                ),
+              )
+                  : Card(
+                color: const Color(0xFF2A2A3C),
+                child: ListTile(
+                  leading: Icon(Icons.security, color: themeColor),
+                  title: const Text("BlackBox"),
+                  subtitle: Text(found!.device.remoteId.toString(),
+                      style: const TextStyle(color: Colors.grey)),
+                  trailing: ElevatedButton(
+                    style: ElevatedButton.styleFrom(
+                        backgroundColor: themeColor),
+                    onPressed: _connect,
+                    child: const Text("Connect"),
+                  ),
+                ),
+              ),
+            ),
+          ] else ...[
+            const Icon(Icons.check_circle, color: Colors.green, size: 44),
+            const SizedBox(height: 6),
+            Text(I18n.t(app.langVN.value, "connected"),
+                style: const TextStyle(color: Colors.green)),
+            const SizedBox(height: 14),
+            Expanded(
+              child: SingleChildScrollView(
+                child: Column(
+                  children: [
+                    _field(_ssid, "WiFi SSID", Icons.wifi),
+                    const SizedBox(height: 10),
+                    _field(
+                      _pass,
+                      "WiFi Password",
+                      Icons.lock,
+                      obscure: obscure,
+                      suffix: IconButton(
+                        icon: Icon(
+                            obscure ? Icons.visibility : Icons.visibility_off),
+                        onPressed: () => setState(() => obscure = !obscure),
+                      ),
+                    ),
+                    const SizedBox(height: 10),
+                    _field(_token, "Telegram Bot Token", Icons.vpn_key),
+                    const SizedBox(height: 10),
+                    _field(_chat, "Telegram Chat ID", Icons.person),
+                    const SizedBox(height: 18),
+                    saving
+                        ? const CircularProgressIndicator()
+                        : ElevatedButton.icon(
+                      style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.green),
+                      onPressed: _sendSetupAndStart,
+                      icon: const Icon(Icons.save),
+                      label: const Text("SAVE & START"),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ]
+        ],
+      ),
+    );
+  }
+
+  Widget _field(TextEditingController c, String label, IconData icon,
+      {bool obscure = false, Widget? suffix}) {
+    return TextField(
+      controller: c,
+      obscureText: obscure,
+      decoration: InputDecoration(
+        labelText: label,
+        prefixIcon: Icon(icon),
+        suffixIcon: suffix,
+        filled: true,
+        fillColor: const Color(0xFF2A2A3C),
+        border: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(14),
+            borderSide: BorderSide.none),
+      ),
+    );
+  }
+}
+
+/// ===========================================================
+/// Update WiFi Modal
+/// ===========================================================
+class UpdateWifiModal extends StatefulWidget {
+  final BluetoothDevice device;
+  const UpdateWifiModal({super.key, required this.device});
+
+  @override
+  State<UpdateWifiModal> createState() => _UpdateWifiModalState();
+}
+
+class _UpdateWifiModalState extends State<UpdateWifiModal> {
+  final _ssid = TextEditingController();
+  final _pass = TextEditingController();
+  final _token = TextEditingController();
+  final _chat = TextEditingController();
+  bool obscure = true;
+  bool saving = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  @override
+  void dispose() {
+    _ssid.dispose();
+    _pass.dispose();
+    _token.dispose();
+    _chat.dispose();
+    super.dispose();
+  }
+
+  Future<void> _load() async {
+    final prefs = await SharedPreferences.getInstance();
+    final id = widget.device.remoteId.toString();
+    if (!mounted) return;
+    setState(() {
+      _ssid.text = prefs.getString("${id}_ssid") ?? "";
+      _pass.text = prefs.getString("${id}_pass") ?? "";
+      _token.text = prefs.getString("${id}_token") ?? "";
+      _chat.text = prefs.getString("${id}_chat") ?? "";
+    });
+  }
+
+  Future<void> _send() async {
+    if (_ssid.text.isEmpty ||
+        _pass.text.isEmpty ||
+        _token.text.isEmpty ||
+        _chat.text.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+            content: Text("⚠️ Please fill all fields"),
+            backgroundColor: Colors.orange),
+      );
+      return;
+    }
+    setState(() => saving = true);
+
+    try {
+      try {
+        await widget.device.connect(autoConnect: false);
+      } catch (e) {}
+
+      final id = widget.device.remoteId.toString();
+      final services = await widget.device.discoverServices();
+
+      Future<void> writeAll(
+          String ssid, String pass, String token, String chat) async {
+        for (final s in services) {
+          if (s.uuid.toString().toLowerCase() ==
+              app.SERVICE_UUID.toLowerCase()) {
+            for (final c in s.characteristics) {
+              final u = c.uuid.toString().toLowerCase();
+              if (u == app.CHAR_SSID.toLowerCase())
+                await c.write(utf8.encode(ssid));
+              if (u == app.CHAR_PASS.toLowerCase())
+                await c.write(utf8.encode(pass));
+              if (u == app.CHAR_TOKEN.toLowerCase())
+                await c.write(utf8.encode(token));
+              if (u == app.CHAR_CHAT.toLowerCase())
+                await c.write(utf8.encode(chat));
+            }
+          }
+        }
+      }
+
+      Future<void> pressSave() async {
+        for (final s in services) {
+          if (s.uuid.toString().toLowerCase() ==
+              app.SERVICE_UUID.toLowerCase()) {
+            for (final c in s.characteristics) {
+              if (c.uuid.toString().toLowerCase() ==
+                  app.CHAR_SAVE.toLowerCase()) {
+                await c.write(utf8.encode("SAVE"));
+              }
+            }
+          }
+        }
+      }
+
+      await writeAll("", "", "", "");
+      await pressSave();
+      await writeAll(_ssid.text, _pass.text, _token.text, _chat.text);
+      await pressSave();
+
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString("${id}_ssid", _ssid.text);
+      await prefs.setString("${id}_pass", _pass.text);
+      await prefs.setString("${id}_token", _token.text);
+      await prefs.setString("${id}_chat", _chat.text);
+
+      app.wifiSsid = _ssid.text.trim();
+      app.wifiIp = "";
+      app.netStatus = NetStatus.unknown;
+      app.liveTick.value++;
+
+      if (!mounted) return;
+      setState(() => saving = false);
+      Navigator.pop(context);
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+            content: Text("✅ WiFi settings updated!"),
+            backgroundColor: Colors.green),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => saving = false);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text("❌ Error: $e"), backgroundColor: Colors.red),
+      );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      height: MediaQuery.of(context).size.height * 0.75,
+      decoration: const BoxDecoration(
+        color: Color(0xFF1E1E2C),
+        borderRadius: BorderRadius.vertical(top: Radius.circular(25)),
+      ),
+      padding: const EdgeInsets.all(16),
+      child: Column(
+        children: [
+          Row(
+            children: [
+              const Text("Update WiFi Settings",
+                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+              const Spacer(),
+              IconButton(
+                  icon: const Icon(Icons.close),
+                  onPressed: () => Navigator.pop(context)),
+            ],
+          ),
+          const SizedBox(height: 10),
+          Expanded(
+            child: SingleChildScrollView(
+              child: Column(
+                children: [
+                  _field(_ssid, "WiFi SSID", Icons.wifi),
+                  const SizedBox(height: 10),
+                  _field(
+                    _pass,
+                    "WiFi Password",
+                    Icons.lock,
+                    obscure: obscure,
+                    suffix: IconButton(
+                      icon: Icon(
+                          obscure ? Icons.visibility : Icons.visibility_off),
+                      onPressed: () => setState(() => obscure = !obscure),
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  _field(_token, "Telegram Bot Token", Icons.vpn_key),
+                  const SizedBox(height: 10),
+                  _field(_chat, "Telegram Chat ID", Icons.person),
+                  const SizedBox(height: 18),
+                  saving
+                      ? const CircularProgressIndicator()
+                      : ElevatedButton.icon(
+                    style: ElevatedButton.styleFrom(
+                        backgroundColor: Colors.green),
+                    onPressed: _send,
+                    icon: const Icon(Icons.save),
+                    label: const Text("UPDATE"),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _field(TextEditingController c, String label, IconData icon,
+      {bool obscure = false, Widget? suffix}) {
+    return TextField(
+      controller: c,
+      obscureText: obscure,
+      decoration: InputDecoration(
+        labelText: label,
+        prefixIcon: Icon(icon),
+        suffixIcon: suffix,
+        filled: true,
+        fillColor: const Color(0xFF2A2A3C),
+        border: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(14),
+            borderSide: BorderSide.none),
+      ),
+    );
+  }
+}
+
